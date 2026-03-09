@@ -2,6 +2,8 @@
 from typing import List, Dict, Any, Optional
 import asyncio
 from datetime import datetime
+
+from CHLoader import ConversationHistoryLoader
 from utils import rerank
 from langchain_core.documents import Document  # 确保导入Document类型
 import json
@@ -30,183 +32,77 @@ def get_llm():
             timeout=40,  # 超时设置
         )
     return llm
-time_analysis_prompt = PromptTemplate(
-    input_variables=["query"],
+from langchain.prompts import PromptTemplate
+from langchain.chains import LLMChain
+from langchain_core.output_parsers import JsonOutputParser
+
+# 查询优化链
+optimize_prompt = PromptTemplate(
+    input_variables=["user_query", "conversation_history"],
     template="""
-    分析查询中的时间意图：
+基于对话历史优化用户查询，使其更适合检索。
 
-    查询：{query}
+对话历史：
+{conversation_history}
 
-    请以JSON格式回答（仅输出JSON，无任何额外文字）：
-    {{
-        "has_time": true/false,
-        "time_keywords": ["关键词列表"],
-        "time_intent": "简短描述",
-        "time_range_type": "今天/昨天/本周/上周/本月/上月/今年/去年/最近N天/具体日期/无",
-        "relative_days": 相对天数（如'最近3天'则为3，否则为null）,
-        "time_field": "added_time/content_time/both/none",
-        "needs_time_filter": true/false
-    }}
-    """
+用户当前查询：{user_query}
+
+要求：
+- 如果查询中有指代词（如“它”“那个”），结合历史替换为具体实体。
+- 如果历史中有相关上下文，补充完整。
+- 只输出优化后的查询，不要解释。
+
+优化查询：
+"""
 )
+optimize_chain = LLMChain(llm=get_llm(), prompt=optimize_prompt, output_key="optimized_query")
 
-time_analysis_chain = LLMChain(
-    llm=get_llm(),
-    prompt=time_analysis_prompt,
-    output_key="time_analysis_json",
-    verbose=False
-)
-
-
-# ===================== 新增：时间分析结果校验函数（无侵入式） =====================
-def validate_time_analysis(time_analysis_json):
-    """
-    校验并修复时间分析的JSON结果，避免格式异常导致后续流程报错
-    仅作为辅助函数，不改动原有链逻辑
-    """
-    try:
-        time_data = json.loads(time_analysis_json)
-        # 补全缺失字段（避免KeyError）
-        default_fields = {
-            "has_time": False,
-            "time_keywords": [],
-            "time_intent": "",
-            "time_range_type": "无",
-            "relative_days": None,
-            "time_field": "none",
-            "needs_time_filter": False
-        }
-        for field, default_val in default_fields.items():
-            if field not in time_data:
-                time_data[field] = default_val
-        return json.dumps(time_data, ensure_ascii=False)
-    except:
-        # 解析失败时返回默认JSON
-        return json.dumps({
-            "has_time": False,
-            "time_keywords": [],
-            "time_intent": "",
-            "time_range_type": "无",
-            "relative_days": None,
-            "time_field": "none",
-            "needs_time_filter": False
-        }, ensure_ascii=False)
-
-
-# ===================== 原有链2：查询优化链（优化提示词，增强时间关联） =====================
-query_optimize_prompt = PromptTemplate(
-    input_variables=["query", "time_analysis_json"],
+# 检索必要性判断链（输出JSON）
+retrieval_prompt = PromptTemplate(
+    input_variables=["user_query", "conversation_history"],
     template="""
-    基于时间分析优化查询：
+判断用户查询是否需要检索外部知识库。
 
-    原始查询：{query}
-    时间分析：{time_analysis_json}
+对话历史：
+{conversation_history}
 
-    优化规则：
-    1. 若time_analysis_json中has_time为true，将time_keywords和time_intent融入优化查询，保留原始查询核心语义；
-    2. 若needs_time_filter为true，在优化查询中明确时间范围（如"2024年5月销售数据"而非仅"销售数据"）；
-    3. 优化查询仅用于检索，无需额外解释，长度控制在50字内；
-    4. 无时间意图时，仅对原始查询做同义改写（更适配检索场景）。
+用户查询：{user_query}
 
-    优化查询：
-    """
-)  # 修改点：新增明确的优化规则，提升查询优化的稳定性
+请以JSON格式输出：
+{{
+    "needs_retrieval": true/false,
+    "reason": "简要原因"
+}}
 
-query_optimize_chain = LLMChain(
-    llm=get_llm(),
-    prompt=query_optimize_prompt,
-    output_key="optimized_query",
-    verbose=False
+判断规则：
+- 如果是问候、感谢、闲聊等，无需检索 → false
+- 如果涉及事实、数据、文档内容，或含有“什么”“如何”“为什么”等疑问词 → true
+- 如果对话历史中已提供足够信息，可判断为false
+"""
 )
+retrieval_chain = LLMChain(llm=get_llm(), prompt=retrieval_prompt, output_key="retrieval_json")
 
-# ===================== 原有结果生成链（优化提示词，增强时间线逻辑） =====================
-result_generation_prompt = PromptTemplate(
-    input_variables=["optimized_query", "retrieved_docs", "time_analysis_json"],
-    template="""
-    基于优化后的查询、检索到的文档和时间分析结果，生成最终回答：
-
-    优化查询：{optimized_query}
-    时间分析：{time_analysis_json}
-    检索文档：{retrieved_docs}
-
-    回答要求：
-    1. 先解析time_analysis_json：
-       - 若has_time为true且needs_time_filter为true：优先筛选检索文档中与time_keywords匹配的内容，按时间从新到旧排序，分点呈现时间线；
-       - 若has_time为true但无匹配时间内容：明确说明"未找到[{time_keywords}]相关的时间维度内容"；
-       - 无时间意图时，总结检索文档中最相关的核心信息（不超过3点）；
-    2. 回答简洁，仅基于检索文档，不编造信息；
-    3. 时间线格式示例：
-       - 2024-05：XXX
-       - 2024-04：XXX
-    """
-)  # 修改点：新增时间筛选/排序规则、无匹配内容的兜底说明
-
-result_generation_chain = LLMChain(
-    llm=get_llm(),
-    prompt=result_generation_prompt,
-    output_key="final_answer",
-    verbose=False
-)
+from langchain_core.runnables import RunnableParallel, RunnablePassthrough
 
 
-# ===================== 新增：检索文档时间预处理（无侵入式，不改动原有检索逻辑） =====================
-def preprocess_retrieved_docs(retrieved_docs, time_analysis_json):
-    """
-    基于时间分析结果，对检索文档做轻量预处理（排序/过滤）
-    仅作为辅助函数，不改动原有retrieve_docs逻辑
-    """
-    try:
-        time_data = json.loads(time_analysis_json)
-        # 仅当需要时间过滤时，对文档做简单排序（按时间关键词匹配度）
-        if time_data.get("needs_time_filter") and time_data.get("time_keywords"):
-            time_keywords = time_data["time_keywords"]
-            # 优先保留包含时间关键词的文档，放前面
-            matched_docs = []
-            unmatched_docs = []
-            for doc in retrieved_docs:
-                doc_text = doc if isinstance(doc, str) else doc.page_content  # 兼容不同文档格式
-                if any(keyword in doc_text for keyword in time_keywords):
-                    matched_docs.append(doc_text)
-                else:
-                    unmatched_docs.append(doc_text)
-            # 拼接处理后的文档（匹配的在前，不匹配的在后）
-            return "\n".join(matched_docs + unmatched_docs[:2])  # 仅保留2条不匹配的，减少冗余
-        return retrieved_docs  # 无需过滤时返回原文档
-    except:
-        return retrieved_docs  # 解析失败时返回原文档
+def build_preprocessing_chain(memory):
+    history_loader = ConversationHistoryLoader(memory,use_conversation=True)
 
+    # 并行执行两个子链
+    parallel_tasks = RunnableParallel(
+        optimized_query=optimize_chain,  # 输出 "optimized_query"
+        retrieval_json=retrieval_chain  # 输出 "retrieval_json"
+    )
 
-# ===================== 合并完整流程（新增辅助步骤，不改动原有链的执行顺序） =====================
-# 方式1：保留SequentialChain，通过前置/后置辅助函数优化（推荐，无侵入）
-def run_full_rag_chain(query, retrieved_docs):
-    # 步骤1：执行时间分析链
-    time_analysis_result = time_analysis_chain.run({"query": query})
-    # 新增：校验时间分析结果
-    validated_time_analysis = validate_time_analysis(time_analysis_result)
-
-    # 步骤2：执行查询优化链
-    optimize_result = query_optimize_chain.run({
-        "query": query,
-        "time_analysis_json": validated_time_analysis
-    })
-
-    # 新增：预处理检索文档（基于时间分析结果排序/过滤）
-    processed_docs = preprocess_retrieved_docs(retrieved_docs, validated_time_analysis)
-
-    # 步骤3：执行结果生成链
-    final_result = result_generation_chain.run({
-        "optimized_query": optimize_result,
-        "retrieved_docs": processed_docs,
-        "time_analysis_json": validated_time_analysis
-    })
-
-    # 返回与原流程一致的输出格式
-    return {
-        "time_analysis_json": validated_time_analysis,
-        "optimized_query": optimize_result,
-        "final_answer": final_result
-    }
-
+    # 完整预处理链：先加载历史，再并行执行，最后解析retrieval_json为布尔值
+    preprocessing_chain = (
+            history_loader
+            | parallel_tasks
+            | RunnablePassthrough.assign(
+        needs_retrieval=lambda x: json.loads(x["retrieval_json"]).get("needs_retrieval", True)
+    )
+    )
+    return preprocessing_chain
 
 class RAGPipeline:
     """RAG处理管道"""
@@ -221,6 +117,8 @@ class RAGPipeline:
         self.retriever = retriever
         self.full_chain = full_chain
         self.conversation_memory = conversation_memory
+
+        self.preprocessing_chain = build_preprocessing_chain(conversation_memory)
 
     async def process_query(
             self,
@@ -343,7 +241,7 @@ class RAGPipeline:
 
     def _should_retrieve_for_query(self, user_query: str, conversation_history: List[Dict]) -> bool:
         """判断是否需要检索"""
-        simple_queries = ["你好", "谢谢", "再见", "在吗", "hi", "hello"]
+        simple_queries = ["你好", "谢谢", "再见", "在吗", "hi", "hello",""]
         if user_query.lower() in [q.lower() for q in simple_queries]:
             return False
 
@@ -400,12 +298,7 @@ class RAGPipeline:
 
     # ==================== 阶段3: 构建阶段 ====================
     def _format_retrieved_docs_to_str(self, retrieved_docs: List[Document]) -> str:
-        """
-        修复核心：
-        1. 添加self参数
-        2. 适配langchain Document对象（page_content属性 + metadata字典）
-        3. 格式化检索到的文档为字符串
-        """
+
         if not retrieved_docs:
             return "无相关参考文档"
 
